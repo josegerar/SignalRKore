@@ -123,6 +123,7 @@ class HubConnection private constructor(
     val connectionId: StateFlow<String?> = _connectionId.asStateFlow()
 
     private var transport: Transport? = null
+    private var handshakeRemainder: ByteArray? = null
 
     internal constructor(
         url: String,
@@ -251,7 +252,10 @@ class HubConnection private constructor(
         resetServerTimeout()
 
         scope.launch {
+            val initialPayload = handshakeRemainder
+            handshakeRemainder = null
             transport.receive()
+                .onStart { initialPayload?.let { emit(it) } }
                 .catch {
                     if (automaticReconnect !is AutomaticReconnect.Inactive) reconnect(it.message)
                     else stop(it.message)
@@ -340,12 +344,13 @@ class HubConnection private constructor(
     }.buildString()
 
     private suspend fun handleHandshake(transport: Transport) {
-        val handshakeCandidate = String(transport.receive().onEmpty { delay(handshakeResponseTimeout) }.first())
-
-        if (handshakeCandidate.last() != RECORD_SEPARATOR) throw RuntimeException("HubMessage is incomplete.")
+        handshakeRemainder = null
+        val handshakeCandidate = transport.receive().onEmpty { delay(handshakeResponseTimeout) }.first()
+        val (handshakeJson, remainder) = splitHandshakePayload(handshakeCandidate)
+        handshakeRemainder = remainder
 
         val handshake = try {
-            Json.decodeFromString<HandshakeResponse>(handshakeCandidate.substring(0, handshakeCandidate.lastIndex))
+            Json.decodeFromString<HandshakeResponse>(handshakeJson)
         } catch (ex: SerializationException) {
             throw RuntimeException("An invalid handshake response was received from the server.", ex)
         }
@@ -471,4 +476,17 @@ class HubConnection private constructor(
         private const val NEGOTIATE_VERSION = 1
         private const val MAX_NEGOTIATE_ATTEMPTS = 100
     }
+}
+
+internal fun splitHandshakePayload(payload: ByteArray): Pair<String, ByteArray?> {
+    val separatorIndex = payload.indexOf(RECORD_SEPARATOR.code.toByte())
+    if (separatorIndex < 0) throw RuntimeException("HubMessage is incomplete.")
+
+    val remainder = if (separatorIndex + 1 < payload.size) {
+        payload.copyOfRange(separatorIndex + 1, payload.size)
+    } else {
+        null
+    }
+
+    return payload.decodeToString(endIndex = separatorIndex) to remainder
 }
